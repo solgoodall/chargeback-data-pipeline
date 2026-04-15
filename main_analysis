@@ -1,0 +1,76 @@
+import os
+import json
+import pandas as pd
+from glob import glob
+import zipfile
+
+if os.path.exists('Chargeback Records 2.zip'):
+    with zipfile.ZipFile('Chargeback Records 2.zip', 'r') as z:
+        z.extractall('/content/')
+    print("Files successfully extracted.")
+
+fx_path = glob("**/exchange_rates.json", recursive=True)[0]
+with open(fx_path, 'r') as f:
+    FX_MAP = json.load(f)
+BACKUP_DATE = sorted(FX_MAP.keys())[-1]
+
+def CALCULATE_USD(amt, cur, dt):
+    try:
+        d_str = pd.to_datetime(dt).strftime('%Y-%m-%d')
+        day_data = FX_MAP.get(d_str, FX_MAP[BACKUP_DATE])
+        rate = day_data.get(str(cur).strip(), 1.0)
+        return round(float(amt) / float(rate), 2)
+    except: return 0.0
+
+all_files = glob("/content/Chargeback Records/**/*.*", recursive=True)
+final_list = []
+
+for p in all_files:
+    if p.endswith('.zip') or 'exchange_rates' in p or os.path.isdir(p): continue
+    
+    df = pd.DataFrame()
+    if p.endswith('.json'):
+        with open(p, 'r') as f:
+            j = json.load(f)
+            df = pd.DataFrame([j]) if isinstance(j, dict) else pd.DataFrame(j)
+    else:
+        try:
+            sep = '\t' if '\t' in open(p).read(1024) else ','
+            df = pd.read_csv(p, sep=sep)
+        except: continue
+
+    if not df.empty:
+        d_col = next((c for c in df.columns if any(x in c.lower() for x in ['date', 'dispute'])), None)
+        a_col = next((c for c in df.columns if any(x in c.lower() for x in ['amount', 'value'])), None)
+        c_col = next((c for c in df.columns if any(x in c.lower() for x in ['curr', 'currency'])), None)
+
+        if d_col and a_col and c_col:
+            temp = pd.DataFrame()
+            temp['Date'] = df[d_col]
+            temp['Merchant'] = "Ingenico" if "Ingenico" in p else "Adyen" if "Adyen" in p else "Stripe"
+          
+            folder_name = os.path.basename(os.path.dirname(p))
+            temp['Region'] = folder_name if folder_name.lower() != 'content' else 'Global'
+            
+            temp['Amount'] = df[a_col]
+            temp['Currency'] = df[c_col]
+            
+            temp['Amount_USD'] = temp.apply(lambda r: CALCULATE_USD(r['Amount'], r['Currency'], r['Date']), axis=1)
+            
+            final_list.append(temp[temp['Amount_USD'] > 0])
+
+if final_list:
+    full_report = pd.concat(final_list, ignore_index=True)
+    
+    initial = len(full_report)
+    full_report = full_report.drop_duplicates(subset=['Date', 'Merchant', 'Amount', 'Currency'])
+    removed = initial - len(full_report)
+    
+    full_report.to_csv('FINAL_MISSION_DATA.csv', index=False)
+    
+    print(f"\n--- MISSION SUCCESS ---")
+    print(f"Transactions Recovered: {len(full_report)}")
+    print(f"Duplicates Removed: {removed}")
+    print(f"TOTAL RISK EXPOSURE: ${full_report['Amount_USD'].sum():,.2f} USD")
+else:
+    print("Error: No data records found.")
